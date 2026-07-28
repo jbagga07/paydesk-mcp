@@ -7,19 +7,24 @@ import datetime
 import jwt
 from contextlib import contextmanager
 from dotenv import load_dotenv
-
+import hashlib
 # Load environment variables first
 load_dotenv()
 
 from db.redisdb import client
+EXPECTED_AUDIENCE = "paydesk-mcp-server"
 
 # ContextVar to store the authenticated CallerContext for the current request
 current_caller_context: contextvars.ContextVar[Optional["CallerContext"]] = contextvars.ContextVar(
     "current_caller_context", default=None
 )
 
-JWT_SECRET = os.getenv("JWT_SECRET", "paydesk_jwt_secret_key_2026_safe_and_long_enough")
+JWT_SECRET = os.getenv("JWT_SECRET")
 
+if not JWT_SECRET:
+    raise RuntimeError(
+        "JWT_SECRET environment variable is required."
+    )
 
 @dataclass
 class CallerContext:
@@ -50,8 +55,10 @@ def generate_token(caller_id: str, expires_in_seconds: int = 3600) -> str:
     """
     payload = {
         "sub": caller_id,
+        "aud": EXPECTED_AUDIENCE,
         "exp": datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(seconds=expires_in_seconds),
+        
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
@@ -62,13 +69,22 @@ def validate_token(token: str) -> str:
     Raises ValueError for expired or malformed/invalid tokens.
     """
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            audience=EXPECTED_AUDIENCE
+        )
         return payload["sub"]
+
     except jwt.ExpiredSignatureError:
         raise ValueError("Token has expired")
+
+    except jwt.InvalidAudienceError:
+        raise ValueError("Invalid audience")
+
     except jwt.InvalidTokenError:
         raise ValueError("Invalid or malformed token")
-
 
 def get_current_caller() -> CallerContext:
     """

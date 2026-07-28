@@ -1,19 +1,58 @@
+import functools
+import inspect
 from mcp.server.fastmcp import FastMCP
 
 from db.redisdb import get_redis
 from db.postgres import get_connection
 from db.mongodb import get_db
+from security.auth import get_current_caller
+from security.scope import is_authorized
+
+def require_merchant_auth(required_scope: str):
+    """
+    Decorator to enforce authentication and authorization for merchant resources.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                # 1. Authenticate caller
+                context = get_current_caller()
+                
+                # 2. Extract merchant_id from arguments
+                sig = inspect.signature(func)
+                bound_args = sig.bind(*args, **kwargs)
+                bound_args.apply_defaults()
+                
+                merchant_id = bound_args.arguments.get("merchant_id")
+                
+                # 3. If caller is merchant, ignore URI's merchant_id and use context.merchant_id
+                if context.caller_type == "merchant":
+                    merchant_id = context.merchant_id
+                
+                # 4. Authorize caller
+                if not is_authorized(context, merchant_id, required_scope=required_scope):
+                    return {
+                        "error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to access merchant '{merchant_id}' with scope '{required_scope}'."
+                    }
+                
+                # Update bound arguments with the resolved merchant_id
+                bound_args.arguments["merchant_id"] = merchant_id
+                
+                # 5. Call the actual resource function and return its response
+                return func(*bound_args.args, **bound_args.kwargs)
+                
+            except Exception as e:
+                return {"error": str(e)}
+        return wrapper
+    return decorator
 
 
 def register_resources(mcp: FastMCP):
 
     @mcp.resource("merchant://summary/{merchant_id}")
-    def merchant_summary_resource(merchant_id: str):
-        """
-        Read-only merchant summary.
-        """
-
-        # ---------- Redis ----------
+    @require_merchant_auth("txn:read")
+    def merchant_summary_resource(merchant_id):
         redis_client = get_redis()
 
         merchant = redis_client.hgetall(f"merchant:{merchant_id}")
@@ -83,6 +122,7 @@ def register_resources(mcp: FastMCP):
         }
 
     @mcp.resource("merchant://profile/{merchant_id}")
+    @require_merchant_auth("txn:read")
     def merchant_profile_resource(merchant_id: str):
         """
         Read merchant profile details from Redis.
@@ -92,6 +132,7 @@ def register_resources(mcp: FastMCP):
         return profile if profile else {"error": "Profile not found"}
 
     @mcp.resource("merchant://balance/{merchant_id}")
+    @require_merchant_auth("ledger:read")
     def merchant_balance_resource(merchant_id: str):
         """
         Read current ledger balance details from PostgreSQL.
@@ -115,6 +156,7 @@ def register_resources(mcp: FastMCP):
         return {"merchant_id": merchant_id, "payable_balance": balance}
 
     @mcp.resource("merchant://transactions/recent/{merchant_id}")
+    @require_merchant_auth("txn:read")
     def merchant_recent_transactions_resource(merchant_id: str):
         """
         Read the latest 10 transactions from MongoDB.
@@ -124,6 +166,7 @@ def register_resources(mcp: FastMCP):
         return {"merchant_id": merchant_id, "recent_transactions": txns}
 
     @mcp.resource("merchant://disputes/active/{merchant_id}")
+    @require_merchant_auth("dispute:read")
     def merchant_active_disputes_resource(merchant_id: str):
         """
         Read active disputes from MongoDB.
@@ -133,6 +176,7 @@ def register_resources(mcp: FastMCP):
         return {"merchant_id": merchant_id, "active_disputes": disputes}
 
     @mcp.resource("merchant://tickets/open/{merchant_id}")
+    @require_merchant_auth("ticket:read")
     def merchant_open_tickets_resource(merchant_id: str):
         """
         Read open support tickets from MongoDB.
@@ -142,6 +186,7 @@ def register_resources(mcp: FastMCP):
         return {"merchant_id": merchant_id, "open_tickets": tickets}
 
     @mcp.resource("merchant://payouts/history/{merchant_id}")
+    @require_merchant_auth("ledger:read")
     def merchant_payout_history_resource(merchant_id: str):
         """
         Read payout history from PostgreSQL ledger.
@@ -170,6 +215,7 @@ def register_resources(mcp: FastMCP):
         return {"merchant_id": merchant_id, "payouts": payouts}
 
     @mcp.resource("merchant://api-keys/metadata/{merchant_id}")
+    @require_merchant_auth("api_key:read")
     def merchant_api_keys_resource(merchant_id: str):
         """
         Read active API key metadata from Redis.
@@ -186,6 +232,7 @@ def register_resources(mcp: FastMCP):
         return {"merchant_id": merchant_id, "api_keys": keys}
 
     @mcp.resource("merchant://webhooks/config/{merchant_id}")
+    @require_merchant_auth("webhook:read")
     def merchant_webhooks_resource(merchant_id: str):
         """
         Read merchant webhook configuration from Redis.
@@ -201,6 +248,7 @@ def register_resources(mcp: FastMCP):
         return {"merchant_id": merchant_id, "webhook_config": config}
 
     @mcp.resource("merchant://fees/schedule/{merchant_id}")
+    @require_merchant_auth("ledger:read")
     def merchant_fees_resource(merchant_id: str):
         """
         Read fee schedule pricing tier from PostgreSQL.
@@ -235,6 +283,7 @@ def register_resources(mcp: FastMCP):
         }
 
     @mcp.resource("merchant://audit-logs/{merchant_id}")
+    @require_merchant_auth("audit:read")
     def merchant_audit_logs_resource(merchant_id: str):
         """
         Read merchant access audit logs from MongoDB.
@@ -282,6 +331,7 @@ def register_resources(mcp: FastMCP):
         )
 
     @mcp.resource("merchant://health/score/{merchant_id}")
+    @require_merchant_auth("txn:read")
     def merchant_health_score_resource(merchant_id: str):
         """
         Get merchant risk and operations health metrics.
@@ -307,4 +357,4 @@ def register_resources(mcp: FastMCP):
         """
         db = get_db()
         customer = db.customers.find_one({"customer_id": customer_id}, {"_id": 0})
-        return customer if customer else {"error": f"Customer '{customer_id}' not found"}
+        return customer if customer else {"error": f"Customer '{customer_id}' not found"}

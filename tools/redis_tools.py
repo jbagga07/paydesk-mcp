@@ -7,6 +7,7 @@ import uuid
 import datetime
 import json
 from typing import Optional
+import hashlib
 
 redis_client = get_redis()
 
@@ -102,6 +103,7 @@ def create_api_key(
     # Generate a key and token
     key_id = f"key_{uuid.uuid4().hex[:12]}"
     secret_token = f"pk_live_{uuid.uuid4().hex}"
+    token_hash = hashlib.sha256(secret_token.encode()).hexdigest()
     
     metadata = {
         "key_id": key_id,
@@ -115,7 +117,13 @@ def create_api_key(
     # Store in Redis hash
     redis_client.hset(f"merchant:{merchant_id}:api_keys", key_id, json.dumps(metadata))
     # Also store the mapping secret_token -> merchant_id for auth simulation
-    redis_client.set(f"token_auth:{secret_token}", json.dumps({"merchant_id": merchant_id, "scopes": scopes}))
+    redis_client.set(
+    f"token_auth:{token_hash}",
+    json.dumps({
+        "merchant_id": merchant_id,
+        "scopes": scopes
+    })
+) 
 
     return {
         "message": "API key created successfully. Please record the secret token, as it will not be displayed again.",

@@ -144,14 +144,24 @@ class LLMPlanner:
         # Format list of available tools to supply to the LLM system instructions
         tool_descriptions = []
         for t in tools:
+            schema = t.get("inputSchema", {})
+            properties = {}
+            if isinstance(schema, dict) and "properties" in schema:
+                for prop_name, prop_data in schema["properties"].items():
+                    if isinstance(prop_data, dict):
+                        properties[prop_name] = {
+                            "type": prop_data.get("type", "string")
+                        }
             tool_descriptions.append({
                 "name": t.get("name"),
                 "description": t.get("description"),
-                "input_schema": t.get("inputSchema", {})
+                "parameters": properties
             })
 
         system_instruction = f"""You are the planning engine for a PayDesk MCP client.
 You are connected to an MCP server exposing internal databases for merchant operations.
+The currently authenticated client ID (which is also the merchant ID) is: {CLIENT_ID}
+
 You NEVER answer user questions from memory. You must always select an MCP tool to fetch the required information.
 Your job is to select the appropriate tool and arguments based on the user's query and the conversation history.
 
@@ -160,28 +170,24 @@ Available MCP Tools:
 
 Rules:
 1. You must select exactly ONE tool from the list above.
-2. Return ONLY a valid JSON object. No explanations, no markdown formatting (do not wrap in ```json), no text outside the JSON.
+2. Return ONLY a valid JSON object matching the schema below. No explanations, no markdown, no other text.
 3. The JSON must match this exact schema:
 {{
-    "tool": "tool_name",
+    "tool": "tool_name_or_null",
     "arguments": {{
         "arg_name": "arg_value"
     }}
 }}
-If no tool is suitable or needed, return:
-{{
-    "tool": null,
-    "arguments": {{}}
-}}
 
 Examples:
-User: "What's my balance?"
-Your Response:
-{{"tool": "get_merchant_balance", "arguments": {{"merchant_id": "MER-1005"}}}}
+- User: "What's my balance?"
+  Response: {{"tool": "get_merchant_balance", "arguments": {{"merchant_id": "{CLIENT_ID}"}}}}
 
-User: "Check transaction TXN-20001"
-Your Response:
-{{"tool": "get_transaction_status", "arguments": {{"txn_id": "TXN-20001"}}}}
+- User: "Check transaction TXN-20001"
+  Response: {{"tool": "get_transaction_status", "arguments": {{"txn_id": "TXN-20001"}}}}
+
+- User: "show me my recent transactions"
+  Response: {{"tool": "get_recent_transactions", "arguments": {{"merchant_id": "{CLIENT_ID}", "limit": 10}}}}
 """
 
         # Construct payload with system instructions first
@@ -191,6 +197,7 @@ Your Response:
         response = ollama.chat(
             model=self.model_name,
             messages=messages,
+            format="json",
             options={"temperature": 0.0}  # Deterministic planning
         )
         

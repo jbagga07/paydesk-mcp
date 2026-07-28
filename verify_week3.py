@@ -8,7 +8,7 @@ from starlette.middleware import Middleware
 sys.path.insert(0, "d:\\OneDrive\\Desktop\\paydesk-mcp")
 
 from mcp_app import mcp
-from security.auth import generate_token, validate_token, resolve_caller, BearerAuthMiddleware
+from security.auth import generate_token, validate_token, resolve_caller, BearerAuthMiddleware, JWT_SECRET
 import jwt
 
 # Import and register all tools, resources, and prompts
@@ -124,15 +124,33 @@ def main():
             "body": res_malformed.json() if res_malformed.status_code == 401 else res_malformed.text
         })
         
-    # Case C: Request with expired token
+   
+    # Case C: Request with wrong audience token
+    wrong_audience_payload = {
+        "sub": "MER-1001",
+        "aud": "admin-dashboard",   # Wrong audience
+        "exp": datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(hours=1),
+    }
+
+    token_wrong_audience = jwt.encode(
+        wrong_audience_payload,
+        JWT_SECRET,
+        algorithm="HS256"
+    )
+
     with TestClient(app) as client:
         client.headers.update({"Accept": "application/json"})
-        res_expired = client.post("/mcp", json=json_rpc_request, headers={"Authorization": f"Bearer {token_expired}"})
-        pretty_print("Case C: Expired Token (Expected: 401)", {
-            "status_code": res_expired.status_code,
-            "body": res_expired.json() if res_expired.status_code == 401 else res_expired.text
-        })
+        res_wrong_audience = client.post(
+            "/mcp",
+            json=json_rpc_request,
+            headers={"Authorization": f"Bearer {token_wrong_audience}"}
+        )
 
+        pretty_print("Case C: Wrong Audience Token (Expected: 401)", {
+            "status_code": res_wrong_audience.status_code,
+            "body": res_wrong_audience.json() if res_wrong_audience.status_code == 401 else res_wrong_audience.text
+        })
     # Case D: Request with valid token for MER-1005 (Requires session ID)
     with TestClient(app) as client:
         client.headers.update({"Accept": "application/json"})
