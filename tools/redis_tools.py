@@ -1,7 +1,6 @@
 from mcp_app import mcp
 from db.redisdb import get_redis
-from security.auth import get_current_caller
-from security.scope import is_authorized
+from security.scope import scoped
 from security.audit import audit_logged
 import uuid
 import datetime
@@ -13,22 +12,12 @@ redis_client = get_redis()
 
 
 @mcp.tool
+@scoped(required_scope="txn:read", error_msg="Unauthorized: Caller '{caller_id}' cannot access merchant '{merchant_id}'.")
 @audit_logged
 def get_merchant(merchant_id: str):
     """
     Get merchant details from Redis.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="txn:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access merchant '{merchant_id}'."}
-
     key = f"merchant:{merchant_id}"
     merchant = redis_client.hgetall(key)
 
@@ -39,22 +28,12 @@ def get_merchant(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="api_key:read", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to read API keys for merchant '{merchant_id}'.")
 @audit_logged
 def get_api_keys(merchant_id: str):
     """
     Get metadata of active API keys (IDs, scopes, prefix, creation date, status) for a merchant.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="api_key:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to read API keys for merchant '{merchant_id}'."}
-
     key = f"merchant:{merchant_id}:api_keys"
     keys_data = redis_client.hgetall(key)
 
@@ -69,6 +48,7 @@ def get_api_keys(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="api_key:write", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to create API keys for merchant '{merchant_id}'.")
 @audit_logged
 def create_api_key(
     merchant_id: str,
@@ -79,17 +59,6 @@ def create_api_key(
     """
     Generate a new API token for the merchant, hash it, and store metadata in Redis.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="api_key:write"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to create API keys for merchant '{merchant_id}'."}
-
     if not name or not name.strip():
         return {"error": "Validation failed: Key name cannot be empty."}
 
@@ -118,12 +87,12 @@ def create_api_key(
     redis_client.hset(f"merchant:{merchant_id}:api_keys", key_id, json.dumps(metadata))
     # Also store the mapping secret_token -> merchant_id for auth simulation
     redis_client.set(
-    f"token_auth:{token_hash}",
-    json.dumps({
-        "merchant_id": merchant_id,
-        "scopes": scopes
-    })
-) 
+        f"token_auth:{token_hash}",
+        json.dumps({
+            "merchant_id": merchant_id,
+            "scopes": scopes
+        })
+    ) 
 
     return {
         "message": "API key created successfully. Please record the secret token, as it will not be displayed again.",
@@ -134,6 +103,7 @@ def create_api_key(
 
 
 @mcp.tool
+@scoped(required_scope="api_key:write", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to revoke API keys for merchant '{merchant_id}'.")
 @audit_logged
 def revoke_api_key(
     merchant_id: str,
@@ -143,17 +113,6 @@ def revoke_api_key(
     """
     Revoke/delete a specific API key from Redis.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="api_key:write"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to revoke API keys for merchant '{merchant_id}'."}
-
     hash_key = f"merchant:{merchant_id}:api_keys"
     
     if not redis_client.hexists(hash_key, key_id):
@@ -177,22 +136,12 @@ def revoke_api_key(
 
 
 @mcp.tool
+@scoped(required_scope="webhook:read", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to read webhook configuration for merchant '{merchant_id}'.")
 @audit_logged
 def get_webhook_config(merchant_id: str):
     """
     Retrieve webhook destination URL and active subscribed events.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="webhook:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to read webhook configuration for merchant '{merchant_id}'."}
-
     key = f"merchant:{merchant_id}:webhook"
     config = redis_client.hgetall(key)
 
@@ -210,6 +159,7 @@ def get_webhook_config(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="webhook:write", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to update webhook configuration for merchant '{merchant_id}'.")
 @audit_logged
 def update_webhook_config(
     merchant_id: str,
@@ -220,17 +170,6 @@ def update_webhook_config(
     """
     Create or update the webhook URL and events in Redis.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="webhook:write"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to update webhook configuration for merchant '{merchant_id}'."}
-
     if not url.startswith("http://") and not url.startswith("https://"):
         return {"error": "Validation failed: Webhook URL must start with http:// or https://"}
 
@@ -262,22 +201,12 @@ def update_webhook_config(
 
 
 @mcp.tool
+@scoped(required_scope="session:read", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to read sessions for merchant '{merchant_id}'.")
 @audit_logged
 def get_active_sessions(merchant_id: str):
     """
     Retrieve active merchant dashboard sessions from Redis.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="session:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to read sessions for merchant '{merchant_id}'."}
-
     key = f"merchant:{merchant_id}:sessions"
     sessions_data = redis_client.hgetall(key)
 
@@ -292,6 +221,7 @@ def get_active_sessions(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="session:write", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to revoke sessions for merchant '{merchant_id}'.")
 @audit_logged
 def revoke_session(
     merchant_id: str,
@@ -301,17 +231,6 @@ def revoke_session(
     """
     Force log out/revoke a dashboard session by deleting its key.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="session:write"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to revoke sessions for merchant '{merchant_id}'."}
-
     hash_key = f"merchant:{merchant_id}:sessions"
 
     if not redis_client.hexists(hash_key, session_id):
@@ -334,22 +253,12 @@ def revoke_session(
 
 
 @mcp.tool
+@scoped(required_scope="api_key:read", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to view rate limits for merchant '{merchant_id}'.")
 @audit_logged
 def get_rate_limit_status(merchant_id: str):
     """
     Check the current rate limit usage and quota status for the merchant's API in Redis.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="api_key:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to view rate limits for merchant '{merchant_id}'."}
-
     # Simulate/fetch rate limit bucket from Redis
     bucket_key = f"rate_limit:{merchant_id}:minute"
     current_count = redis_client.get(bucket_key)

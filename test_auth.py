@@ -1,23 +1,19 @@
+import pytest
 from security.auth import resolve_caller
 
-test_callers = [
-    "MER-1001",
-    "MER-1005",
-    "AGT-01",
-    "ADM-01",
-    "FIN-01",
-    "INVALID"
-]
-
-for caller in test_callers:
-    print("=" * 60)
-    print(f"Testing caller: {caller}")
-
-    try:
+def test_resolve_valid_callers():
+    test_callers = [
+        "MER-1001",
+        "MER-1005",
+        "AGT-01",
+        "ADM-01",
+        "FIN-01"
+    ]
+    for caller in test_callers:
         context = resolve_caller(caller)
+        assert context is not None
+        assert context.caller_id == caller
 
-        print("Resolved Successfully")
-        print(context)
-
-    except Exception as e:
-        print(f"Error: {e}")
+def test_resolve_invalid_caller():
+    with pytest.raises(Exception):
+        resolve_caller("INVALID")

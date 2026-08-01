@@ -1,7 +1,7 @@
 from mcp_app import mcp
 from db.mongodb import get_db
 from security.auth import get_current_caller
-from security.scope import is_authorized
+from security.scope import is_authorized, scoped
 from security.audit import audit_logged, get_audit_logs as get_audit_logs_helper
 import datetime
 import uuid
@@ -11,17 +11,13 @@ db = get_db()
 
 
 @mcp.tool
+@scoped(required_scope="txn:read")
 @audit_logged
 def get_transaction_status(txn_id: str):
     """
     Get transaction details by transaction ID.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
+    context = get_current_caller()
     txn = db.transactions.find_one(
         {"txn_id": txn_id},
         {"_id": 0}
@@ -40,25 +36,12 @@ def get_transaction_status(txn_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="txn:read", error_msg="Unauthorized: Caller '{caller_id}' cannot access transaction data for merchant '{merchant_id}'.")
 @audit_logged
 def get_recent_transactions(merchant_id: str, limit: int = 10):
     """
     Get the latest transactions for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="txn:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access transaction data for merchant '{merchant_id}'."}
-
     transactions = list(
         db.transactions.find(
             {"merchant_id": merchant_id},
@@ -82,25 +65,12 @@ def get_recent_transactions(merchant_id: str, limit: int = 10):
 
 
 @mcp.tool
+@scoped(required_scope="txn:read", error_msg="Unauthorized: Caller '{caller_id}' cannot access transaction data for merchant '{merchant_id}'.")
 @audit_logged
 def get_failed_transactions(merchant_id: str, limit: int = 10):
     """
     Get the latest failed transactions for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="txn:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access transaction data for merchant '{merchant_id}'."}
-
     transactions = list(
         db.transactions.find(
             {
@@ -127,25 +97,12 @@ def get_failed_transactions(merchant_id: str, limit: int = 10):
 
 
 @mcp.tool
+@scoped(required_scope="txn:read", error_msg="Unauthorized: Caller '{caller_id}' cannot access transaction data for merchant '{merchant_id}'.")
 @audit_logged
 def get_transaction_count(merchant_id: str):
     """
     Get the total transaction count for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="txn:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access transaction data for merchant '{merchant_id}'."}
-
     count = db.transactions.count_documents({"merchant_id": merchant_id})
 
     return {
@@ -155,25 +112,12 @@ def get_transaction_count(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="txn:read", error_msg="Unauthorized: Caller '{caller_id}' cannot access transaction data for merchant '{merchant_id}'.")
 @audit_logged
 def get_success_rate(merchant_id: str):
     """
     Get the transaction success rate statistics for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="txn:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access transaction data for merchant '{merchant_id}'."}
-
     total_count = db.transactions.count_documents({"merchant_id": merchant_id})
 
     if total_count == 0:
@@ -203,25 +147,12 @@ def get_success_rate(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="txn:read", error_msg="Unauthorized: Caller '{caller_id}' cannot access transaction data for merchant '{merchant_id}'.")
 @audit_logged
 def get_daily_transaction_summary(merchant_id: str):
     """
     Get the daily transaction summary (aggregates of count and amount) for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="txn:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access transaction data for merchant '{merchant_id}'."}
-
     pipeline = [
         {"$match": {"merchant_id": merchant_id}},
         {
@@ -305,25 +236,12 @@ def get_daily_transaction_summary(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="dispute:read", error_msg="Unauthorized: Caller '{caller_id}' cannot access dispute data for merchant '{merchant_id}'.")
 @audit_logged
 def get_dispute_count(merchant_id: str):
     """
     Get dispute count and status statistics for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="dispute:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access dispute data for merchant '{merchant_id}'."}
-
     disputes_cursor = db.disputes.find({"merchant_id": merchant_id})
     disputes_list = list(disputes_cursor)
 
@@ -384,6 +302,7 @@ def generate_ticket_id(db) -> str:
 
 
 @mcp.tool
+@scoped(required_scope="ticket:write", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to create tickets for merchant '{merchant_id}'.")
 @audit_logged
 def create_support_ticket(
     merchant_id: str,
@@ -395,19 +314,7 @@ def create_support_ticket(
     """
     Create a support ticket for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="ticket:write"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to create tickets for merchant '{merchant_id}'."}
+    context = get_current_caller()
 
     # Approval gate check
     if not approved:
@@ -475,20 +382,12 @@ def create_support_ticket(
 
 
 @mcp.tool
+@scoped(admin_only=True, admin_only_msg="Unauthorized: Only administrators can view audit logs.")
 @audit_logged
 def get_audit_logs(target_caller_id: Optional[str] = None, limit: int = 20):
     """
     Get audit logs. Only accessible by admins.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type != "admin" or context.role != "ADMIN":
-        return {"error": "Unauthorized: Only administrators can view audit logs."}
-
     logs = get_audit_logs_helper(target_caller_id, limit)
     return {
         "logs": logs
@@ -496,16 +395,13 @@ def get_audit_logs(target_caller_id: Optional[str] = None, limit: int = 20):
 
 
 @mcp.tool
+@scoped(required_scope="dispute:read")
 @audit_logged
 def get_dispute_details(dispute_id: str):
     """
     Retrieve dispute details (dispute ID, transaction ID, reason, amount, status, evidence) by dispute ID.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
+    context = get_current_caller()
     dispute = db.disputes.find_one({"dispute_id": dispute_id}, {"_id": 0})
     if dispute is None:
         return {"error": f"Dispute '{dispute_id}' not found."}
@@ -517,6 +413,7 @@ def get_dispute_details(dispute_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="dispute:write")
 @audit_logged
 def update_dispute_evidence(
     dispute_id: str,
@@ -527,11 +424,7 @@ def update_dispute_evidence(
     """
     Submit evidence text or document URLs to a dispute in MongoDB.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
+    context = get_current_caller()
     dispute = db.disputes.find_one({"dispute_id": dispute_id}, {"_id": 0})
     if dispute is None:
         return {"error": f"Dispute '{dispute_id}' not found."}
@@ -579,6 +472,7 @@ def update_dispute_evidence(
 
 
 @mcp.tool
+@scoped(required_scope="dispute:read", error_msg="Unauthorized: Caller '{caller_id}' cannot access dispute data for merchant '{merchant_id}'.")
 @audit_logged
 def list_merchant_disputes(
     merchant_id: str,
@@ -588,17 +482,6 @@ def list_merchant_disputes(
     """
     List all disputes for a merchant, filtered optionally by status.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="dispute:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access dispute data for merchant '{merchant_id}'."}
-
     query = {"merchant_id": merchant_id}
     if status:
         query["status"] = status
@@ -613,16 +496,13 @@ def list_merchant_disputes(
 
 
 @mcp.tool
+@scoped(required_scope="ticket:read")
 @audit_logged
 def get_support_ticket(ticket_id: str):
     """
     Fetch a support ticket by ticket ID.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
+    context = get_current_caller()
     ticket = db.tickets.find_one({"ticket_id": ticket_id}, {"_id": 0})
     if ticket is None:
         return {"error": f"Support ticket '{ticket_id}' not found."}
@@ -634,6 +514,7 @@ def get_support_ticket(ticket_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="ticket:write")
 @audit_logged
 def add_ticket_reply(
     ticket_id: str,
@@ -643,11 +524,7 @@ def add_ticket_reply(
     """
     Add reply messages from a merchant or admin to a support ticket.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
+    context = get_current_caller()
     ticket = db.tickets.find_one({"ticket_id": ticket_id}, {"_id": 0})
     if ticket is None:
         return {"error": f"Support ticket '{ticket_id}' not found."}
@@ -692,6 +569,7 @@ def add_ticket_reply(
 
 
 @mcp.tool
+@scoped(required_scope="ticket:write")
 @audit_logged
 def update_ticket_status(
     ticket_id: str,
@@ -701,11 +579,7 @@ def update_ticket_status(
     """
     Change ticket status (OPEN, IN_PROGRESS, RESOLVED, CLOSED).
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
+    context = get_current_caller()
     ticket = db.tickets.find_one({"ticket_id": ticket_id}, {"_id": 0})
     if ticket is None:
         return {"error": f"Support ticket '{ticket_id}' not found."}
@@ -737,16 +611,13 @@ def update_ticket_status(
 
 
 @mcp.tool
+@scoped(required_scope="customer:read")
 @audit_logged
 def get_customer_profile(customer_id: str):
     """
     Retrieve customer details from MongoDB collection.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
+    context = get_current_caller()
     customer = db.customers.find_one({"customer_id": customer_id}, {"_id": 0})
     if customer is None:
         return {"error": f"Customer '{customer_id}' not found."}
@@ -758,6 +629,7 @@ def get_customer_profile(customer_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="customer:write", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to create customers for merchant '{merchant_id}'.")
 @audit_logged
 def create_customer_profile(
     merchant_id: str,
@@ -769,17 +641,6 @@ def create_customer_profile(
     """
     Create a new customer profile in MongoDB.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="customer:write"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to create customers for merchant '{merchant_id}'."}
-
     if "@" not in email:
         return {"error": "Validation failed: Email is invalid."}
 
@@ -820,6 +681,7 @@ def create_customer_profile(
 
 
 @mcp.tool
+@scoped(required_scope="customer:write")
 @audit_logged
 def update_customer_profile(
     customer_id: str,
@@ -830,11 +692,7 @@ def update_customer_profile(
     """
     Modify customer profile details in MongoDB.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
+    context = get_current_caller()
     customer = db.customers.find_one({"customer_id": customer_id}, {"_id": 0})
     if customer is None:
         return {"error": f"Customer '{customer_id}' not found."}
@@ -870,22 +728,12 @@ def update_customer_profile(
 
 
 @mcp.tool
+@scoped(required_scope="webhook:read", error_msg="Unauthorized: Caller '{caller_id}' cannot read webhook logs for merchant '{merchant_id}'.")
 @audit_logged
 def get_webhook_delivery_logs(merchant_id: str, limit: int = 10):
     """
     Retrieve webhook delivery logs for debugging.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="webhook:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to read webhook logs for merchant '{merchant_id}'."}
-
     logs = list(
         db.webhook_logs.find({"merchant_id": merchant_id}, {"_id": 0})
         .sort("timestamp", -1)

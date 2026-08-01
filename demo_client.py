@@ -24,7 +24,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # =====================================================================
 # CLIENT CONFIGURATION (Change this value to switch caller)
 # =====================================================================
-CLIENT_ID: str = "MER-1005"  # <-- USER CONFIGURATION (e.g. MER-1005, ADM-01, AGT-01, etc.)
+CLIENT_ID: str = "MER-1001"  # <-- USER CONFIGURATION (e.g. MER-1005, ADM-01, AGT-01, etc.)
 # =====================================================================
 
 SERVER_URL: str = "https://127.0.0.1:8000/mcp"
@@ -49,6 +49,23 @@ except Exception:
         "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=86400)
     }
     JWT_TOKEN = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+# =====================================================================
+# Role Helper
+# =====================================================================
+
+def get_role_name(client_id: str) -> str:
+    """Returns the user role based on the CLIENT_ID prefix."""
+    if client_id.startswith("MER-"):
+        return "Merchant"
+    elif client_id.startswith("AGT-"):
+        return "Support Agent"
+    elif client_id.startswith("FIN-"):
+        return "Finance User"
+    elif client_id.startswith("ADM-"):
+        return "Administrator"
+    return "Unknown Role"
 
 
 # =====================================================================
@@ -90,12 +107,13 @@ class Logger:
 
     def print_header(self, server_url: str, authenticated_as: str, llm_model: str) -> None:
         """Displays the startup panel detailing connectivity parameters."""
+        role = get_role_name(authenticated_as)
         header_text = Text()
         header_text.append("=====================================\n", style="bold green")
         header_text.append("PayDesk AI Assistant (Interactive CLI)\n", style="bold white")
         header_text.append("=====================================\n", style="bold green")
         header_text.append(f"Connected to:\n  {server_url}\n\n", style="cyan")
-        header_text.append(f"Authenticated as:\n  {authenticated_as}\n\n", style="cyan")
+        header_text.append(f"Authenticated as:\n  {authenticated_as} ({role})\n\n", style="cyan")
         header_text.append(f"LLM Model:\n  {llm_model}\n\n", style="cyan")
         header_text.append('Type "exit" or "quit" to quit.\n', style="italic yellow")
         
@@ -160,7 +178,21 @@ class LLMPlanner:
 
         system_instruction = f"""You are the planning engine for a PayDesk MCP client.
 You are connected to an MCP server exposing internal databases for merchant operations.
-The currently authenticated client ID (which is also the merchant ID) is: {CLIENT_ID}
+The currently authenticated client ID is: {CLIENT_ID}
+
+Role Context:
+- MER-* IDs represent merchants (e.g., MER-1001).
+- AGT-* IDs represent support agents (e.g., AGT-01).
+- FIN-* IDs represent finance users (e.g., FIN-01).
+- ADM-* IDs represent administrators (e.g., ADM-01).
+
+Critical Rules:
+1. ONLY merchant identifiers (starting with 'MER-') may ever be used as merchant_id.
+2. Agent IDs (AGT-*), finance IDs (FIN-*), and admin IDs (ADM-*) are USER/STAFF identifiers, NOT merchant identifiers. Do NOT copy them into merchant_id arguments under any circumstances.
+3. For tools requesting merchant data, the server automatically derives the merchant from the JWT token for Merchant users.
+   - If the authenticated client ID is a merchant (MER-*), do not pass merchant_id (e.g. leave the arguments dictionary empty or exclude merchant_id) unless the user explicitly asks to view a different merchant's data and the tool/server permits it.
+   - If the authenticated user is an Agent (AGT-*), Finance (FIN-*), or Admin (ADM-*), never set merchant_id to the authenticated client ID (e.g., do not set "merchant_id": "{CLIENT_ID}").
+   - If a tool has a merchant_id parameter, do not populate it with the user's ID. Leave it out unless the user explicitly asks to look up a particular merchant (e.g., "for merchant MER-1002").
 
 You NEVER answer user questions from memory. You must always select an MCP tool to fetch the required information.
 Your job is to select the appropriate tool and arguments based on the user's query and the conversation history.
@@ -180,14 +212,20 @@ Rules:
 }}
 
 Examples:
-- User: "What's my balance?"
-  Response: {{"tool": "get_merchant_balance", "arguments": {{"merchant_id": "{CLIENT_ID}"}}}}
+- User: "What's my balance?" (when logged in as a merchant, e.g. MER-1001)
+  Response: {{"tool": "get_merchant_balance", "arguments": {{}}}}
 
 - User: "Check transaction TXN-20001"
   Response: {{"tool": "get_transaction_status", "arguments": {{"txn_id": "TXN-20001"}}}}
 
-- User: "show me my recent transactions"
-  Response: {{"tool": "get_recent_transactions", "arguments": {{"merchant_id": "{CLIENT_ID}", "limit": 10}}}}
+- User: "show me recent transactions" (when logged in as a merchant or agent without specifying a merchant)
+  Response: {{"tool": "get_recent_transactions", "arguments": {{"limit": 50}}}}
+
+- User: "show settlements" (when logged in as finance or admin)
+  Response: {{"tool": "get_settlement_records", "arguments": {{}}}}
+
+- User: "show transactions for merchant MER-1002"
+  Response: {{"tool": "get_recent_transactions", "arguments": {{"merchant_id": "MER-1002", "limit": 50}}}}
 """
 
         # Construct payload with system instructions first
@@ -218,12 +256,27 @@ Examples:
         """
         Asks Ollama to summarize the raw tool outputs into a friendly response.
         """
-        system_instruction = """You are PayDesk, a helpful, precise financial support AI assistant.
+        system_instruction = f"""You are PayDesk, a helpful, precise financial support AI assistant.
 Your job is to read the raw database response (JSON) from the MCP tool call and formulate a clear, professional, and friendly answer to the user's query.
-- Make sure to format numbers as currency (e.g. ₹145,190.03) when appropriate.
-- Keep the response direct and helpful.
-- Reference details from the query or history if helpful.
-- Do not mention technical terms like "MCP tool", "database query", or "JSON response". Speak naturally.
+
+Context:
+- The currently authenticated user ID is: {CLIENT_ID}
+- MER-* IDs represent merchants.
+- AGT-* IDs represent support agents.
+- FIN-* IDs represent finance users.
+- ADM-* IDs represent administrators.
+
+Rules for Natural Language Responses:
+1. Answer according to the authenticated role.
+2. The user ID ({CLIENT_ID}) represents a user/staff member, not a merchant (unless it is a MER-* ID). Never treat agent IDs, finance IDs, or admin IDs as merchant IDs.
+3. If no records (e.g., transactions, settlements, etc.) are found:
+   - For support agents (AGT-*), instead of "No transactions found for merchant {CLIENT_ID}", say "No transactions were found" or "No transactions are available for the requested time period."
+   - For finance users (FIN-*), instead of "No settlement records found for merchant {CLIENT_ID}", say "No settlement records were found."
+   - In general, do not say "No transactions found for merchant X" or "No records found for merchant X" where X is an agent/finance/admin ID. Simply state that no records were found.
+4. If a merchant was explicitly requested in the query (e.g., "for merchant MER-1002"), then mentioning the merchant in the response is acceptable and expected.
+5. Format numbers as currency (e.g. ₹145,190.03) when appropriate.
+6. Keep the response direct and helpful.
+7. Do not mention technical terms like "MCP tool", "database query", or "JSON response". Speak naturally.
 """
         messages = [{"role": "system", "content": system_instruction}]
         
@@ -410,7 +463,7 @@ def main() -> None:
         timeout=TIMEOUT
     )
     
-    logger.print_header(SERVER_URL, "MER-1005", OLLAMA_MODEL)
+    logger.print_header(SERVER_URL, CLIENT_ID, OLLAMA_MODEL)
     
     logger.console.print("[cyan]Establishing secure session with MCP server...[/cyan]")
     try:

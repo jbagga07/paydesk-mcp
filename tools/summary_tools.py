@@ -3,18 +3,20 @@ from db.redisdb import get_redis
 from db.mongodb import get_db
 from db.postgres import get_connection
 from security.auth import get_current_caller
-from security.scope import is_authorized
+from security.scope import is_authorized, scoped
 from security.audit import audit_logged
 import uuid
 import datetime
 import json
 from typing import Optional
+from decimal import Decimal
 
 redis_client = get_redis()
 mongo_db = get_db()
 
 
 @mcp.tool
+@scoped(required_scopes=["txn:read", "ledger:read"], error_msg="Unauthorized: Caller '{caller_id}' cannot access summary data for merchant '{merchant_id}'.")
 @audit_logged
 def get_merchant_summary(merchant_id: str):
     """
@@ -23,20 +25,6 @@ def get_merchant_summary(merchant_id: str):
     - PostgreSQL (merchant balance)
     - MongoDB (recent transactions)
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization (needs both txn:read and ledger:read scopes for admins)
-    if not is_authorized(context, merchant_id, required_scopes=["txn:read", "ledger:read"]):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access summary data for merchant '{merchant_id}'."}
-
     # -----------------------------
     # Get Merchant Profile (Redis)
     # -----------------------------
@@ -92,20 +80,19 @@ def get_merchant_summary(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scopes=["txn:write", "ledger:write"])
 @audit_logged
 def process_refund(
     txn_id: str,
     amount: float,
     reason: str,
+    request_id: str,
     approved: bool = False
 ):
     """
     Process a refund for a transaction. Debits merchant ledger balance and updates transaction status in Mongo.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
+    context = get_current_caller()
 
     # 1. Fetch transaction from MongoDB
     txn = mongo_db.transactions.find_one({"txn_id": txn_id}, {"_id": 0})
@@ -116,12 +103,48 @@ def process_refund(
     if not is_authorized(context, merchant_id, required_scopes=["txn:write", "ledger:write"]):
         return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot process refunds for merchant '{merchant_id}'."}
 
+    # Validation
+    if not request_id or not request_id.strip():
+        return {"error": "Validation failed: Request ID cannot be empty."}
+
+    amount_dec = Decimal(str(amount))
+
+    # Idempotency Check (PostgreSQL)
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT txn_id, amount 
+                FROM ledger 
+                WHERE request_id = %s 
+                  AND account = 'merchant_payable'
+                LIMIT 1;
+                """,
+                (request_id,)
+            )
+            existing_row = cur.fetchone()
+            if existing_row:
+                conn.close()
+                ref_txn = mongo_db.transactions.find_one({"txn_id": existing_row[0]}, {"_id": 0})
+                ref_status = ref_txn.get("status") if ref_txn else "REFUNDED"
+                return {
+                    "message": "Refund already processed (idempotent response)",
+                    "txn_id": existing_row[0],
+                    "refund_amount": float(existing_row[1]),
+                    "status": ref_status
+                }
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
     if txn["status"] not in ["CAPTURED", "SETTLED", "PARTIALLY_REFUNDED"]:
         return {"error": f"Validation failed: Transaction with status '{txn['status']}' cannot be refunded."}
 
-    original_amount = float(txn["amount"])
-    if amount <= 0 or amount > original_amount:
-        return {"error": f"Validation failed: Invalid refund amount. Original: {original_amount}, Requested: {amount}"}
+    original_amount_dec = Decimal(str(txn["amount"]))
+    if amount_dec <= 0 or amount_dec > original_amount_dec:
+        return {"error": f"Validation failed: Invalid refund amount. Original: {float(original_amount_dec)}, Requested: {amount}"}
 
     # 2. Check current refunds in PostgreSQL ledger to avoid over-refunding
     conn = get_connection()
@@ -138,7 +161,7 @@ def process_refund(
                 """,
                 (txn_id,)
             )
-            already_refunded = float(cur.fetchone()[0])
+            already_refunded = cur.fetchone()[0]
             
             # Fetch merchant payable balance
             cur.execute(
@@ -151,15 +174,15 @@ def process_refund(
                 (merchant_id,)
             )
             balance_row = cur.fetchone()
-            current_balance = float(balance_row[0]) if balance_row and balance_row[0] is not None else 0.0
+            current_balance = balance_row[0] if balance_row and balance_row[0] is not None else Decimal("0.0")
 
-        if already_refunded + amount > original_amount:
+        if already_refunded + amount_dec > original_amount_dec:
             conn.close()
-            return {"error": f"Validation failed: Total refunded ({already_refunded + amount}) exceeds transaction amount ({original_amount})."}
+            return {"error": f"Validation failed: Total refunded ({float(already_refunded + amount_dec)}) exceeds transaction amount ({float(original_amount_dec)})."}
 
-        if current_balance < amount:
+        if current_balance < amount_dec:
             conn.close()
-            return {"error": f"Validation failed: Insufficient merchant balance ({current_balance}) to process refund ({amount})."}
+            return {"error": f"Validation failed: Insufficient merchant balance ({float(current_balance)}) to process refund ({amount})."}
 
         if not approved:
             conn.close()
@@ -171,7 +194,8 @@ def process_refund(
                     "amount": amount,
                     "reason": reason,
                     "merchant_id": merchant_id,
-                    "available_balance": current_balance
+                    "available_balance": float(current_balance),
+                    "request_id": request_id
                 }
             }
 
@@ -184,28 +208,28 @@ def process_refund(
             # Debit merchant_payable
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, %s, %s, NULL, 'merchant_payable', 'DEBIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, %s, %s, '', 'merchant_payable', 'DEBIT', %s, %s, %s, %s)
                 """,
-                (entry_id_debit, txn_id, merchant_id, amount, txn["currency"], posted_at)
+                (entry_id_debit, txn_id, merchant_id, amount_dec, txn["currency"], posted_at, request_id)
             )
             # Credit customer_clearing
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, %s, %s, NULL, 'customer_clearing', 'CREDIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, %s, %s, '', 'customer_clearing', 'CREDIT', %s, %s, %s, %s)
                 """,
-                (entry_id_credit, txn_id, merchant_id, amount, txn["currency"], posted_at)
+                (entry_id_credit, txn_id, merchant_id, amount_dec, txn["currency"], posted_at, request_id)
             )
             conn.commit()
     finally:
         conn.close()
 
     # 4. Update transaction status in MongoDB
-    new_status = "REFUNDED" if already_refunded + amount == original_amount else "PARTIALLY_REFUNDED"
+    new_status = "REFUNDED" if already_refunded + amount_dec == original_amount_dec else "PARTIALLY_REFUNDED"
     mongo_db.transactions.update_one(
         {"txn_id": txn_id},
-        {"$set": {"status": new_status, "refunded_amount": already_refunded + amount}}
+        {"$set": {"status": new_status, "refunded_amount": float(already_refunded + amount_dec)}}
     )
 
     return {
@@ -217,22 +241,12 @@ def process_refund(
 
 
 @mcp.tool
+@scoped(required_scopes=["dispute:read", "ledger:read"], error_msg="Unauthorized: Caller '{caller_id}' cannot access chargeback summary for merchant '{merchant_id}'.")
 @audit_logged
 def get_chargeback_summary(merchant_id: str):
     """
     Correlates dispute records from MongoDB with PostgreSQL ledger entries to show chargeback statistics.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scopes=["dispute:read", "ledger:read"]):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' cannot access chargeback summary for merchant '{merchant_id}'."}
-
     # Fetch disputes from MongoDB
     disputes = list(mongo_db.disputes.find({"merchant_id": merchant_id}, {"_id": 0}))
     dispute_ids = [d["dispute_id"] for d in disputes]
@@ -258,32 +272,32 @@ def get_chargeback_summary(merchant_id: str):
     finally:
         conn.close()
 
-    ledger_debits = {r[0]: {"amount": float(r[1]), "currency": r[2]} for r in ledger_rows}
+    ledger_debits = {r[0]: {"amount": r[1], "currency": r[2]} for r in ledger_rows}
 
-    total_contested_amount = 0.0
+    total_contested_amount = Decimal("0.0")
     active_disputes_count = 0
-    financial_impact = 0.0
+    financial_impact = Decimal("0.0")
 
     dispute_list_summary = []
     for d in disputes:
         tid = d.get("txn_id")
         status = d.get("status")
-        amt = float(d.get("amount", 0.0))
+        amt = Decimal(str(d.get("amount", 0.0)))
 
         total_contested_amount += amt
         if status in ["OPEN", "UNDER_REVIEW"]:
             active_disputes_count += 1
 
         # Correlate with ledger debit
-        impact = ledger_debits.get(tid, {}).get("amount", 0.0)
+        impact = ledger_debits.get(tid, {}).get("amount", Decimal("0.0"))
         financial_impact += impact
 
         dispute_list_summary.append({
             "dispute_id": d.get("dispute_id"),
             "txn_id": tid,
             "status": status,
-            "amount": amt,
-            "ledger_impact": impact,
+            "amount": float(amt),
+            "ledger_impact": float(impact),
             "currency": d.get("currency", "INR")
         })
 
@@ -291,42 +305,34 @@ def get_chargeback_summary(merchant_id: str):
         "merchant_id": merchant_id,
         "total_disputes": len(disputes),
         "active_disputes": active_disputes_count,
-        "total_contested_amount": round(total_contested_amount, 2),
-        "ledger_debit_impact": round(financial_impact, 2),
+        "total_contested_amount": float(total_contested_amount),
+        "ledger_debit_impact": float(financial_impact),
         "disputes": dispute_list_summary
     }
 
 
 @mcp.tool
+@scoped(required_scopes=["txn:write", "ledger:write"], error_msg="Unauthorized: Caller is not authorized to create transactions for merchant '{merchant_id}'.")
 @audit_logged
 def create_transaction(
     merchant_id: str,
     amount: float,
     currency: str,
     payment_method: str,
+    request_id: str,
     customer_id: Optional[str] = None,
     approved: bool = False
 ):
     """
     Simulate creating a new payment transaction. Checks Redis, inserts in Mongo, and creates ledger entries in Postgres.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scopes=["txn:write", "ledger:write"]):
-        return {"error": f"Unauthorized: Caller is not authorized to create transactions for merchant '{merchant_id}'."}
-
     # 1. Validate Merchant Profile in Redis
     merchant_profile = redis_client.hgetall(f"merchant:{merchant_id}")
     if not merchant_profile:
         return {"error": f"Validation failed: Merchant '{merchant_id}' does not exist or is inactive in Redis."}
 
-    if amount <= 0:
+    amount_dec = Decimal(str(amount))
+    if amount_dec <= 0:
         return {"error": "Validation failed: Transaction amount must be positive."}
 
     if not approved:
@@ -337,30 +343,67 @@ def create_transaction(
                 "merchant_id": merchant_id,
                 "amount": amount,
                 "currency": currency,
-                "payment_method": payment_method
+                "payment_method": payment_method,
+                "request_id": request_id
+            }
+        }
+
+    # Validation
+    if not request_id or not request_id.strip():
+        return {"error": "Validation failed: Request ID cannot be empty."}
+
+    # Idempotency Check (MongoDB)
+    existing_txn = mongo_db.transactions.find_one({"request_id": request_id}, {"_id": 0})
+    if existing_txn:
+        conn = get_connection()
+        fixed_fee = Decimal("0.30")
+        pct_fee = Decimal("2.90")
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT fixed_fee, percentage_fee FROM fee_schedule WHERE merchant_id = %s", (merchant_id,))
+                row = cur.fetchone()
+                if row:
+                    fixed_fee = row[0]
+                    pct_fee = row[1]
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+        fee = Decimal(str(existing_txn.get("fee", 0.0)))
+        net_amount = round(Decimal(str(existing_txn["amount"])) - fee, 2)
+
+        return {
+            "message": "Transaction already exists (idempotent response)",
+            "transaction": existing_txn,
+            "fee_calculation": {
+                "percentage_rate": f"{float(pct_fee)}%",
+                "fixed_rate": float(fixed_fee),
+                "calculated_fee": float(fee),
+                "net_amount": float(net_amount)
             }
         }
 
     # 2. Fetch Fee Schedule from Postgres to compute transaction fees
     conn = get_connection()
-    fixed_fee = 0.30
-    pct_fee = 2.90
+    fixed_fee = Decimal("0.30")
+    pct_fee = Decimal("2.90")
     try:
         with conn.cursor() as cur:
             # check fee schedule table
             cur.execute("SELECT fixed_fee, percentage_fee FROM fee_schedule WHERE merchant_id = %s", (merchant_id,))
             row = cur.fetchone()
             if row:
-                fixed_fee = float(row[0])
-                pct_fee = float(row[1])
+                fixed_fee = row[0]
+                pct_fee = row[1]
     except Exception:
         pass
     finally:
         conn.close()
 
     # Compute Fee
-    fee = round((amount * (pct_fee / 100.0)) + fixed_fee, 2)
-    net_amount = round(amount - fee, 2)
+    fee = (amount_dec * (pct_fee / Decimal("100.0")) + fixed_fee).quantize(Decimal("0.01"))
+    net_amount = amount_dec - fee
 
     txn_id = f"TXN-{uuid.uuid4().hex[:6].upper()}"
     created_at = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -370,12 +413,13 @@ def create_transaction(
         "txn_id": txn_id,
         "merchant_id": merchant_id,
         "customer_id": customer_id or "",
-        "amount": amount,
+        "amount": float(amount_dec),
         "currency": currency,
         "status": "SETTLED",
         "payment_method": payment_method,
-        "fee": fee,
-        "created_at": created_at
+        "fee": float(fee),
+        "created_at": created_at,
+        "request_id": request_id
     }
     mongo_db.transactions.insert_one(dict(new_txn))
     new_txn.pop("_id", None)
@@ -392,26 +436,26 @@ def create_transaction(
             # Debit customer_clearing
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, %s, %s, NULL, 'customer_clearing', 'DEBIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, %s, %s, '', 'customer_clearing', 'DEBIT', %s, %s, %s, %s)
                 """,
-                (entry_id_clear, txn_id, merchant_id, amount, currency, posted_at)
+                (entry_id_clear, txn_id, merchant_id, amount_dec, currency, posted_at, request_id)
             )
             # Credit merchant_payable
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, %s, %s, NULL, 'merchant_payable', 'CREDIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, %s, %s, '', 'merchant_payable', 'CREDIT', %s, %s, %s, %s)
                 """,
-                (entry_id_payable, txn_id, merchant_id, net_amount, currency, posted_at)
+                (entry_id_payable, txn_id, merchant_id, net_amount, currency, posted_at, request_id)
             )
             # Credit fee_income
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, %s, %s, NULL, 'fee_income', 'CREDIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, %s, %s, '', 'fee_income', 'CREDIT', %s, %s, %s, %s)
                 """,
-                (entry_id_fee, txn_id, merchant_id, fee, currency, posted_at)
+                (entry_id_fee, txn_id, merchant_id, fee, currency, posted_at, request_id)
             )
             conn.commit()
     finally:
@@ -421,24 +465,22 @@ def create_transaction(
         "message": "Transaction processed successfully.",
         "transaction": new_txn,
         "fee_calculation": {
-            "percentage_rate": f"{pct_fee}%",
-            "fixed_rate": fixed_fee,
-            "calculated_fee": fee,
-            "net_amount": net_amount
+            "percentage_rate": f"{float(pct_fee)}%",
+            "fixed_rate": float(fixed_fee),
+            "calculated_fee": float(fee),
+            "net_amount": float(net_amount)
         }
     }
 
 
 @mcp.tool
+@scoped(required_scopes=["txn:write", "ledger:write"])
 @audit_logged
-def capture_payment(txn_id: str, approved: bool = False):
+def capture_payment(txn_id: str, request_id: str, approved: bool = False):
     """
     Capture a pre-authorized payment. Updates status in Mongo and ledger entries in Postgres.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
+    context = get_current_caller()
 
     txn = mongo_db.transactions.find_one({"txn_id": txn_id}, {"_id": 0})
     if not txn:
@@ -448,38 +490,60 @@ def capture_payment(txn_id: str, approved: bool = False):
     if not is_authorized(context, merchant_id, required_scopes=["txn:write", "ledger:write"]):
         return {"error": f"Unauthorized: Caller is not authorized to capture payments for merchant '{merchant_id}'."}
 
-    if txn["status"] != "AUTHORIZED":
-        return {"error": f"Validation failed: Only transactions with AUTHORIZED status can be captured. Current status: '{txn['status']}'."}
-
     if not approved:
         return {
             "status": "AWAITING_APPROVAL",
             "message": "Capture payment requires explicit approval. Set approved=True to capture.",
-            "details": {"txn_id": txn_id, "amount": txn["amount"], "merchant_id": merchant_id}
+            "details": {
+                "txn_id": txn_id,
+                "amount": txn["amount"],
+                "merchant_id": merchant_id,
+                "request_id": request_id
+            }
         }
+
+    # Validation
+    if not request_id or not request_id.strip():
+        return {"error": "Validation failed: Request ID cannot be empty."}
+
+    # Idempotency Check
+    existing_txn = mongo_db.transactions.find_one({"capture_request_id": request_id}, {"_id": 0})
+    if existing_txn:
+        return {
+            "message": "Payment already captured (idempotent response)",
+            "txn_id": existing_txn["txn_id"],
+            "amount": float(existing_txn["amount"]),
+            "status": "CAPTURED"
+        }
+
+    if txn["status"] != "AUTHORIZED":
+        return {"error": f"Validation failed: Only transactions with AUTHORIZED status can be captured. Current status: '{txn['status']}'."}
 
     # Fetch fee rate
     conn = get_connection()
-    fixed_fee = 0.30
-    pct_fee = 2.90
+    fixed_fee = Decimal("0.30")
+    pct_fee = Decimal("2.90")
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT fixed_fee, percentage_fee FROM fee_schedule WHERE merchant_id = %s", (merchant_id,))
             row = cur.fetchone()
             if row:
-                fixed_fee = float(row[0])
-                pct_fee = float(row[1])
+                fixed_fee = row[0]
+                pct_fee = row[1]
     except Exception:
         pass
     finally:
         conn.close()
 
-    amount = float(txn["amount"])
-    fee = round((amount * (pct_fee / 100.0)) + fixed_fee, 2)
-    net_amount = round(amount - fee, 2)
+    amount_dec = Decimal(str(txn["amount"]))
+    fee = (amount_dec * (pct_fee / Decimal("100.0")) + fixed_fee).quantize(Decimal("0.01"))
+    net_amount = amount_dec - fee
 
     # 1. Update Mongo transaction status
-    mongo_db.transactions.update_one({"txn_id": txn_id}, {"$set": {"status": "CAPTURED", "fee": fee}})
+    mongo_db.transactions.update_one(
+        {"txn_id": txn_id},
+        {"$set": {"status": "CAPTURED", "fee": float(fee), "capture_request_id": request_id}}
+    )
 
     # 2. Write to Postgres ledger
     conn = get_connection()
@@ -492,24 +556,24 @@ def capture_payment(txn_id: str, approved: bool = False):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, %s, %s, NULL, 'customer_clearing', 'DEBIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, %s, %s, '', 'customer_clearing', 'DEBIT', %s, %s, %s, %s)
                 """,
-                (entry_id_clear, txn_id, merchant_id, amount, txn["currency"], posted_at)
+                (entry_id_clear, txn_id, merchant_id, amount_dec, txn["currency"], posted_at, request_id)
             )
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, %s, %s, NULL, 'merchant_payable', 'CREDIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, %s, %s, '', 'merchant_payable', 'CREDIT', %s, %s, %s, %s)
                 """,
-                (entry_id_payable, txn_id, merchant_id, net_amount, txn["currency"], posted_at)
+                (entry_id_payable, txn_id, merchant_id, net_amount, txn["currency"], posted_at, request_id)
             )
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, %s, %s, NULL, 'fee_income', 'CREDIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, %s, %s, '', 'fee_income', 'CREDIT', %s, %s, %s, %s)
                 """,
-                (entry_id_fee, txn_id, merchant_id, fee, txn["currency"], posted_at)
+                (entry_id_fee, txn_id, merchant_id, fee, txn["currency"], posted_at, request_id)
             )
             conn.commit()
     finally:
@@ -518,28 +582,18 @@ def capture_payment(txn_id: str, approved: bool = False):
     return {
         "message": "Payment captured successfully.",
         "txn_id": txn_id,
-        "amount": amount,
+        "amount": float(amount_dec),
         "status": "CAPTURED"
     }
 
 
 @mcp.tool
+@scoped(required_scopes=["txn:read", "ledger:read"], error_msg="Unauthorized: Caller is not authorized to read reports for merchant '{merchant_id}'.")
 @audit_logged
 def get_payment_method_stats(merchant_id: str):
     """
     Aggregate transaction success count from Mongo and fee metrics from Postgres by payment method.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scopes=["txn:read", "ledger:read"]):
-        return {"error": f"Unauthorized: Caller is not authorized to read reports for merchant '{merchant_id}'."}
-
     # Query Mongo for transactions grouped by payment method
     pipeline = [
         {"$match": {"merchant_id": merchant_id}},
@@ -571,7 +625,7 @@ def get_payment_method_stats(merchant_id: str):
                 """,
                 (merchant_id,)
             )
-            fees_by_txn = {r[0]: float(r[1]) for r in cur.fetchall()}
+            fees_by_txn = {r[0]: r[1] for r in cur.fetchall()}
     finally:
         conn.close()
 
@@ -585,9 +639,9 @@ def get_payment_method_stats(merchant_id: str):
 
         # Fetch all transactions matching this method to calculate average fees
         txns_with_method = list(mongo_db.transactions.find({"merchant_id": merchant_id, "payment_method": method}, {"txn_id": 1}))
-        total_fees = 0.0
+        total_fees = Decimal("0.0")
         for t in txns_with_method:
-            total_fees += fees_by_txn.get(t["txn_id"], 0.0)
+            total_fees += fees_by_txn.get(t["txn_id"], Decimal("0.0"))
 
         results.append({
             "payment_method": method,
@@ -595,29 +649,19 @@ def get_payment_method_stats(merchant_id: str):
             "successful_transactions": successful_count,
             "success_rate": round((successful_count / total_count) * 100, 2) if total_count > 0 else 0.0,
             "total_volume": round(volume, 2),
-            "total_fees_incurred": round(total_fees, 2)
+            "total_fees_incurred": float(total_fees)
         })
 
     return {"merchant_id": merchant_id, "payment_method_stats": results}
 
 
 @mcp.tool
+@scoped(required_scopes=["txn:read", "ledger:read", "ticket:read", "dispute:read"], error_msg="Unauthorized: Caller is not authorized to audit merchant health.")
 @audit_logged
 def check_merchant_health(merchant_id: str):
     """
     Risk report combining Redis profile, Postgres balance, and MongoDB disputes/tickets.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scopes=["txn:read", "ledger:read", "ticket:read", "dispute:read"]):
-        return {"error": f"Unauthorized: Caller is not authorized to audit merchant health."}
-
     # 1. Redis profile
     merchant_profile = redis_client.hgetall(f"merchant:{merchant_id}")
     if not merchant_profile:
@@ -625,7 +669,7 @@ def check_merchant_health(merchant_id: str):
 
     # 2. Postgres balance
     conn = get_connection()
-    balance = 0.0
+    balance = Decimal("0.0")
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -637,7 +681,7 @@ def check_merchant_health(merchant_id: str):
                 (merchant_id,)
             )
             res = cur.fetchone()[0]
-            balance = float(res) if res is not None else 0.0
+            balance = res if res is not None else Decimal("0.0")
     finally:
         conn.close()
 
@@ -661,7 +705,7 @@ def check_merchant_health(merchant_id: str):
         health_score -= deduction
         reasons.append(f"Deducted {deduction} pts for {open_tickets} open support ticket(s).")
 
-    if balance < 0:
+    if balance < Decimal("0.0"):
         health_score -= 25.0
         reasons.append("Deducted 25 pts for negative ledger account balance.")
 
@@ -672,7 +716,7 @@ def check_merchant_health(merchant_id: str):
     return {
         "merchant_id": merchant_id,
         "merchant_name": merchant_profile.get("name", "Unknown"),
-        "ledger_balance": balance,
+        "ledger_balance": float(balance),
         "active_disputes": open_disputes,
         "open_tickets": open_tickets,
         "risk_health_score": health_score,
@@ -682,22 +726,12 @@ def check_merchant_health(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scopes=["webhook:read"], error_msg="Unauthorized: Caller is not authorized to read webhook health.")
 @audit_logged
 def get_webhook_endpoint_health(merchant_id: str):
     """
     Get webhook configuration status (Redis) and check delivery failure rate (Mongo).
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scopes=["webhook:read"]):
-        return {"error": f"Unauthorized: Caller is not authorized to read webhook health."}
-
     # 1. Fetch URL from Redis
     config = redis_client.hgetall(f"merchant:{merchant_id}:webhook")
     if not config:
@@ -724,6 +758,7 @@ def get_webhook_endpoint_health(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scopes=["dispute:write", "ledger:write"])
 @audit_logged
 def resolve_dispute_chargeback(
     dispute_id: str,
@@ -733,10 +768,7 @@ def resolve_dispute_chargeback(
     """
     Resolve dispute document in MongoDB and adjust PostgreSQL ledger holds.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
+    context = get_current_caller()
 
     dispute = mongo_db.disputes.find_one({"dispute_id": dispute_id}, {"_id": 0})
     if not dispute:
@@ -768,7 +800,7 @@ def resolve_dispute_chargeback(
     # If WON_MERCHANT, credit the merchant_payable back in PostgreSQL ledger
     chargeback_reversed = False
     if resolution == "WON_MERCHANT":
-        amount = float(dispute["amount"])
+        amount_dec = Decimal(str(dispute["amount"]))
         currency = dispute["currency"]
         
         conn = get_connection()
@@ -782,7 +814,7 @@ def resolve_dispute_chargeback(
                     INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
                     VALUES (%s, %s, %s, '', 'merchant_payable', 'CREDIT', %s, %s, %s)
                     """,
-                    (entry_id, dispute["txn_id"], merchant_id, amount, currency, posted_at)
+                    (entry_id, dispute["txn_id"], merchant_id, amount_dec, currency, posted_at)
                 )
                 conn.commit()
                 chargeback_reversed = True
@@ -798,21 +830,19 @@ def resolve_dispute_chargeback(
     return {
         "message": f"Dispute resolution set to '{resolution}' successfully.",
         "dispute_id": dispute_id,
-        "chargeback_hold_released": chargeback_reversed,
-        "resolution": resolution
+        "resolution": resolution,
+        "chargeback_reversed": chargeback_reversed
     }
 
 
 @mcp.tool
+@scoped(required_scopes=["customer:read", "ledger:read"])
 @audit_logged
 def get_customer_lifetime_value(customer_id: str):
     """
     Calculate customer purchase volumes, fee summaries, and metrics across Mongo and Postgres.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
+    context = get_current_caller()
 
     # Fetch customer from Mongo
     customer = mongo_db.customers.find_one({"customer_id": customer_id}, {"_id": 0})
@@ -829,8 +859,8 @@ def get_customer_lifetime_value(customer_id: str):
 
     # Query Postgres for actual sums
     conn = get_connection()
-    total_spent = 0.0
-    total_fees = 0.0
+    total_spent = Decimal("0.0")
+    total_fees = Decimal("0.0")
     try:
         with conn.cursor() as cur:
             if txn_ids:
@@ -846,8 +876,8 @@ def get_customer_lifetime_value(customer_id: str):
                 )
                 res = cur.fetchone()
                 if res:
-                    total_spent = float(res[0]) if res[0] is not None else 0.0
-                    total_fees = float(res[1]) if res[1] is not None else 0.0
+                    total_spent = res[0] if res[0] is not None else Decimal("0.0")
+                    total_fees = res[1] if res[1] is not None else Decimal("0.0")
     finally:
         conn.close()
 
@@ -859,26 +889,19 @@ def get_customer_lifetime_value(customer_id: str):
         "customer_email": customer.get("email"),
         "total_transactions": len(txns),
         "successful_transactions": sum(1 for t in txns if t["status"] in ["SETTLED", "CAPTURED"]),
-        "lifetime_gross_spent": round(total_gross, 2),
-        "lifetime_net_merchant_volume": round(total_spent, 2),
-        "total_gateway_fees": round(total_fees, 2)
+        "lifetime_gross_spent": float(total_gross),
+        "lifetime_net_merchant_volume": float(total_spent),
+        "total_gateway_fees": float(total_fees)
     }
 
 
 @mcp.tool
+@scoped(admin_only=True, admin_only_msg="Unauthorized: Only administrators can execute compliance audits.")
 @audit_logged
 def admin_audit_merchant(merchant_id: str):
     """
     Compliance audit tool correlating audit logs (Mongo), keys (Redis), and ledger stats (Postgres). Only accessible by admins.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type != "admin" or context.role != "ADMIN":
-        return {"error": "Unauthorized: Only administrators can execute compliance audits."}
-
     # 1. Get profile from Redis
     merchant_profile = redis_client.hgetall(f"merchant:{merchant_id}")
     if not merchant_profile:
@@ -890,7 +913,7 @@ def admin_audit_merchant(merchant_id: str):
 
     # 3. Get Postgres balance
     conn = get_connection()
-    balance = 0.0
+    balance = Decimal("0.0")
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -902,7 +925,7 @@ def admin_audit_merchant(merchant_id: str):
                 (merchant_id,)
             )
             res = cur.fetchone()[0]
-            balance = float(res) if res is not None else 0.0
+            balance = res if res is not None else Decimal("0.0")
     finally:
         conn.close()
 
@@ -914,7 +937,7 @@ def admin_audit_merchant(merchant_id: str):
         "merchant_id": merchant_id,
         "merchant_name": merchant_profile.get("name", "Unknown"),
         "status": merchant_profile.get("status", "ACTIVE"),
-        "ledger_balance": balance,
+        "ledger_balance": float(balance),
         "active_api_keys": active_keys_count,
         "recent_audit_logs": logs
     }

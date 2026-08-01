@@ -1,5 +1,7 @@
-from security.auth import CallerContext
-from typing import Optional
+from security.auth import CallerContext, get_current_caller
+from typing import Optional, Any
+import functools
+import inspect
 
 def can_access_merchant(
     context: CallerContext,
@@ -76,3 +78,57 @@ def is_authorized(
                 if not has_scope(context, scope):
                     return False
     return True
+
+
+def scoped(
+    required_scope: Optional[str] = None,
+    required_scopes: Optional[list[str]] = None,
+    admin_only: bool = False,
+    admin_only_msg: Optional[str] = None,
+    error_msg: Optional[str] = None
+):
+    """
+    Reusable decorator for authentication, merchant scoping override, and authorization.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                context = get_current_caller()
+            except Exception as e:
+                return {"error": f"Authentication failed: {str(e)}"}
+
+            if admin_only:
+                if context.caller_type != "admin" or context.role != "ADMIN":
+                    msg = admin_only_msg or "Unauthorized: Only administrators can execute this action."
+                    return {"error": msg}
+
+            # Inspect and bind function parameters to check for merchant_id
+            sig = inspect.signature(func)
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+
+            # Override merchant_id for merchants
+            if context.caller_type == "merchant" and "merchant_id" in bound.arguments:
+                bound.arguments["merchant_id"] = context.merchant_id
+
+            merchant_id = bound.arguments.get("merchant_id")
+
+            # Check authorization if scope check or merchant_id check is needed
+            if not is_authorized(
+                context,
+                merchant_id=merchant_id,
+                required_scope=required_scope,
+                required_scopes=required_scopes
+            ):
+                caller_id = context.caller_id
+                if error_msg:
+                    msg = error_msg.format(caller_id=caller_id, merchant_id=merchant_id)
+                else:
+                    msg = f"Unauthorized: Caller '{caller_id}' cannot access merchant '{merchant_id}'."
+                return {"error": msg}
+
+            # Invoke target function with overridden/updated parameters
+            return func(*bound.args, **bound.kwargs)
+        return wrapper
+    return decorator

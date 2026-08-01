@@ -1,33 +1,44 @@
 from mcp_app import mcp
 from db.postgres import get_connection
 from security.auth import get_current_caller
-from security.scope import is_authorized
+from security.scope import is_authorized, scoped
 from security.audit import audit_logged
 import uuid
 import datetime
 from typing import Optional
+from decimal import Decimal
+
+
+def ensure_ledger_request_id_column(conn):
+    """
+    Ensure the request_id column exists in the ledger table in PostgreSQL.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 
+            FROM information_schema.columns 
+            WHERE table_name = 'ledger' AND column_name = 'request_id';
+        """)
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE ledger ADD COLUMN request_id VARCHAR(255);")
+            conn.commit()
+
+
+# Run DB initialization check on load
+_conn = get_connection()
+try:
+    ensure_ledger_request_id_column(_conn)
+finally:
+    _conn.close()
 
 
 @mcp.tool
+@scoped(required_scope="ledger:read", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to access ledger data for merchant '{merchant_id}'.")
 @audit_logged
 def get_merchant_balance(merchant_id: str):
     """
     Get the total payable balance for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="ledger:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to access ledger data for merchant '{merchant_id}'."}
-
     conn = get_connection()
 
     try:
@@ -61,25 +72,12 @@ def get_merchant_balance(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="ledger:read", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to access ledger data for merchant '{merchant_id}'.")
 @audit_logged
 def get_merchant_settlements(merchant_id: str):
     """
     Get recent settlements for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="ledger:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to access ledger data for merchant '{merchant_id}'."}
-
     conn = get_connection()
 
     try:
@@ -134,25 +132,12 @@ def get_merchant_settlements(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="ledger:read", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to access ledger data for merchant '{merchant_id}'.")
 @audit_logged
 def get_ledger_entries(merchant_id: str, limit: int = 20):
     """
     Get the latest ledger entries for a merchant.
     """
-
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    # Never trust merchant_id from the model for merchant callers
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    # Validate authorization
-    if not is_authorized(context, merchant_id, required_scope="ledger:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to access ledger data for merchant '{merchant_id}'."}
-
     conn = get_connection()
 
     try:
@@ -224,28 +209,20 @@ def ensure_fee_schedule_table(conn):
 
 
 @mcp.tool
+@scoped(required_scope="ledger:write", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to write ledger data for merchant '{merchant_id}'.")
 @audit_logged
 def create_settlement_payout(
     merchant_id: str,
     amount: float,
     currency: str,
+    request_id: str,
     approved: bool = False
 ):
     """
     Initiate a settlement payout for a merchant. Transfers funds from merchant_payable.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="ledger:write"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to write ledger data for merchant '{merchant_id}'."}
-
-    if amount <= 0:
+    amount_dec = Decimal(str(amount))
+    if amount_dec <= 0:
         return {"error": "Validation failed: Payout amount must be greater than zero."}
 
     # Fetch net payable balance
@@ -263,11 +240,11 @@ def create_settlement_payout(
                 (merchant_id,),
             )
             balance_row = cur.fetchone()
-            current_balance = float(balance_row[0]) if balance_row and balance_row[0] is not None else 0.0
+            current_balance = balance_row[0] if balance_row and balance_row[0] is not None else Decimal("0.0")
 
-        if amount > current_balance:
+        if amount_dec > current_balance:
             conn.close()
-            return {"error": f"Validation failed: Insufficient balance. Available: {current_balance}, Requested: {amount}"}
+            return {"error": f"Validation failed: Insufficient balance. Available: {float(current_balance)}, Requested: {amount}"}
 
         if not approved:
             conn.close()
@@ -278,9 +255,38 @@ def create_settlement_payout(
                     "merchant_id": merchant_id,
                     "amount": amount,
                     "currency": currency,
-                    "available_balance": current_balance
+                    "available_balance": float(current_balance),
+                    "request_id": request_id
                 }
             }
+
+        # Validation
+        if not request_id or not request_id.strip():
+            conn.close()
+            return {"error": "Validation failed: Request ID cannot be empty."}
+
+        # Idempotency Check
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT settlement_id, amount, currency 
+                FROM ledger 
+                WHERE request_id = %s 
+                  AND account = 'merchant_payable'
+                LIMIT 1;
+                """,
+                (request_id,)
+            )
+            existing_row = cur.fetchone()
+            if existing_row:
+                conn.close()
+                return {
+                    "message": "Payout already initiated (idempotent response)",
+                    "settlement_id": existing_row[0],
+                    "amount": float(existing_row[1]),
+                    "currency": existing_row[2],
+                    "status": "PAID"
+                }
 
         # Create ledger entries for payout
         settlement_id = f"STL-{uuid.uuid4().hex[:6].upper()}"
@@ -292,18 +298,18 @@ def create_settlement_payout(
             # Debit merchant payable
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, '', %s, %s, 'merchant_payable', 'DEBIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, '', %s, %s, 'merchant_payable', 'DEBIT', %s, %s, %s, %s)
                 """,
-                (entry_id_debit, merchant_id, settlement_id, amount, currency, posted_at)
+                (entry_id_debit, merchant_id, settlement_id, amount_dec, currency, posted_at, request_id)
             )
             # Credit bank clearing
             cur.execute(
                 """
-                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at)
-                VALUES (%s, '', %s, %s, 'payout_clearing', 'CREDIT', %s, %s, %s)
+                INSERT INTO ledger (entry_id, txn_id, merchant_id, settlement_id, account, direction, amount, currency, posted_at, request_id)
+                VALUES (%s, '', %s, %s, 'payout_clearing', 'CREDIT', %s, %s, %s, %s)
                 """,
-                (entry_id_credit, merchant_id, settlement_id, amount, currency, posted_at)
+                (entry_id_credit, merchant_id, settlement_id, amount_dec, currency, posted_at, request_id)
             )
             conn.commit()
     finally:
@@ -319,16 +325,13 @@ def create_settlement_payout(
 
 
 @mcp.tool
+@scoped(required_scope="ledger:read")
 @audit_logged
 def get_payout_details(payout_id: str):
     """
     Retrieve payout details by settlement/payout ID.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
+    context = get_current_caller()
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -353,7 +356,7 @@ def get_payout_details(payout_id: str):
         return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to read payout details."}
 
     entries = []
-    total_amount = 0.0
+    total_amount = Decimal("0.0")
     currency = ""
     for r in rows:
         entries.append({
@@ -366,35 +369,25 @@ def get_payout_details(payout_id: str):
             "posted_at": r[8].isoformat()
         })
         if r[4] == 'merchant_payable':
-            total_amount = float(r[6])
+            total_amount = r[6]
             currency = r[7]
 
     return {
         "payout_id": payout_id,
         "merchant_id": merchant_id,
-        "amount": total_amount,
+        "amount": float(total_amount),
         "currency": currency,
         "entries": entries
     }
 
 
 @mcp.tool
+@scoped(required_scope="ledger:read", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to read ledger data for merchant '{merchant_id}'.")
 @audit_logged
 def list_merchant_payouts(merchant_id: str, limit: int = 10):
     """
     List all payouts (settlements) processed for a merchant.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="ledger:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to read ledger data for merchant '{merchant_id}'."}
-
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -430,22 +423,12 @@ def list_merchant_payouts(merchant_id: str, limit: int = 10):
 
 
 @mcp.tool
+@scoped(required_scope="ledger:read", error_msg="Unauthorized: Caller '{caller_id}' is not authorized to view fee schedule for merchant '{merchant_id}'.")
 @audit_logged
 def get_fee_schedule(merchant_id: str):
     """
     Retrieve active fee pricing structure for a merchant.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="ledger:read"):
-        return {"error": f"Unauthorized: Caller '{context.caller_id}' is not authorized to view fee schedule for merchant '{merchant_id}'."}
-
     conn = get_connection()
     try:
         ensure_fee_schedule_table(conn)
@@ -474,6 +457,7 @@ def get_fee_schedule(merchant_id: str):
 
 
 @mcp.tool
+@scoped(required_scope="ledger:write", admin_only=True, admin_only_msg="Unauthorized: Only administrators can update fee schedules.", error_msg="Unauthorized: Caller lacks scopes to update ledger settings for '{merchant_id}'.")
 @audit_logged
 def update_fee_schedule(
     merchant_id: str,
@@ -485,18 +469,10 @@ def update_fee_schedule(
     """
     Update fee schedules for a merchant. Only accessible by admins.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
+    fixed_fee_dec = Decimal(str(fixed_fee))
+    percentage_fee_dec = Decimal(str(percentage_fee))
 
-    if context.caller_type != "admin" or context.role != "ADMIN":
-        return {"error": "Unauthorized: Only administrators can update fee schedules."}
-
-    if not is_authorized(context, merchant_id, required_scope="ledger:write"):
-        return {"error": f"Unauthorized: Caller lacks scopes to update ledger settings for '{merchant_id}'."}
-
-    if fixed_fee < 0 or percentage_fee < 0:
+    if fixed_fee_dec < 0 or percentage_fee_dec < 0:
         return {"error": "Validation failed: Fees cannot be negative."}
 
     if not approved:
@@ -525,7 +501,7 @@ def update_fee_schedule(
                     percentage_fee = EXCLUDED.percentage_fee,
                     updated_at = EXCLUDED.updated_at
                 """,
-                (merchant_id, pricing_tier, fixed_fee, percentage_fee, datetime.datetime.now())
+                (merchant_id, pricing_tier, fixed_fee_dec, percentage_fee_dec, datetime.datetime.now())
             )
             conn.commit()
     finally:
@@ -541,22 +517,12 @@ def update_fee_schedule(
 
 
 @mcp.tool
+@scoped(required_scope="ledger:read", error_msg="Unauthorized: Caller is not authorized to read ledger reports for merchant '{merchant_id}'.")
 @audit_logged
 def get_monthly_accounting_report(merchant_id: str, year: int, month: int):
     """
     Retrieve monthly aggregate sales, refunds, payouts, and fees for accounting.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="ledger:read"):
-        return {"error": f"Unauthorized: Caller is not authorized to read ledger reports for merchant '{merchant_id}'."}
-
     conn = get_connection()
     try:
         start_date = datetime.datetime(year, month, 1)
@@ -596,6 +562,7 @@ def get_monthly_accounting_report(merchant_id: str, year: int, month: int):
 
 
 @mcp.tool
+@scoped(required_scope="ledger:write", admin_only=True, admin_only_msg="Unauthorized: Only administrators can create balance adjustments.", error_msg="Unauthorized: Caller lacks scope to write ledger adjustments for '{merchant_id}'.")
 @audit_logged
 def adjust_ledger_balance(
     merchant_id: str,
@@ -607,17 +574,6 @@ def adjust_ledger_balance(
     """
     Create manual balance adjustments on the ledger. Only accessible by admins.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type != "admin" or context.role != "ADMIN":
-        return {"error": "Unauthorized: Only administrators can create balance adjustments."}
-
-    if not is_authorized(context, merchant_id, required_scope="ledger:write"):
-        return {"error": f"Unauthorized: Caller lacks scope to write ledger adjustments for '{merchant_id}'."}
-
     if not description or not description.strip():
         return {"error": "Validation failed: Adjustment description cannot be empty."}
 
@@ -633,8 +589,9 @@ def adjust_ledger_balance(
             }
         }
 
-    direction = "CREDIT" if amount >= 0 else "DEBIT"
-    abs_amount = abs(amount)
+    amount_dec = Decimal(str(amount))
+    direction = "CREDIT" if amount_dec >= 0 else "DEBIT"
+    abs_amount = abs(amount_dec)
 
     conn = get_connection()
     try:
@@ -664,22 +621,12 @@ def adjust_ledger_balance(
 
 
 @mcp.tool
+@scoped(required_scope="ledger:read", error_msg="Unauthorized: Caller is not authorized to read ledger data for merchant '{merchant_id}'.")
 @audit_logged
 def get_chargeback_financials(merchant_id: str):
     """
     Retrieve all chargeback financial holds/debits for a merchant.
     """
-    try:
-        context = get_current_caller()
-    except Exception as e:
-        return {"error": f"Authentication failed: {str(e)}"}
-
-    if context.caller_type == "merchant":
-        merchant_id = context.merchant_id
-
-    if not is_authorized(context, merchant_id, required_scope="ledger:read"):
-        return {"error": f"Unauthorized: Caller is not authorized to read ledger data for merchant '{merchant_id}'."}
-
     conn = get_connection()
     try:
         with conn.cursor() as cur:

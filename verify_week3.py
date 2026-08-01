@@ -2,14 +2,15 @@ import sys
 import json
 import uuid
 import datetime
+import pytest
 from starlette.testclient import TestClient
 from starlette.middleware import Middleware
+import jwt
 
 sys.path.insert(0, "d:\\OneDrive\\Desktop\\paydesk-mcp")
 
 from mcp_app import mcp
 from security.auth import generate_token, validate_token, resolve_caller, BearerAuthMiddleware, JWT_SECRET
-import jwt
 
 # Import and register all tools, resources, and prompts
 from tools.postgres_tools import *
@@ -21,19 +22,7 @@ register_resources(mcp)
 from prompts.merchant_prompts import register_prompts
 register_prompts(mcp)
 
-# Helper to format output
-def pretty_print(name, data):
-    print(f"=== {name} ===")
-    if isinstance(data, dict) or isinstance(data, list):
-        print(json.dumps(data, indent=2, default=str))
-    else:
-        print(data)
-    print()
-
 def establish_session(client, token: str) -> str:
-    """
-    Establish a session by sending an initialize request and return the session ID.
-    """
     init_request = {
         "jsonrpc": "2.0",
         "method": "initialize",
@@ -57,44 +46,38 @@ def establish_session(client, token: str) -> str:
         raise ValueError(f"No session ID returned in headers: {res.headers}")
     return session_id
 
-def main():
-    print("============================================================")
-    print("1. TESTING JWT TOKEN GENERATION & VALIDATION")
-    print("============================================================")
-    
-    # Test valid token
+# 1. TESTING JWT TOKEN GENERATION & VALIDATION
+
+def test_jwt_token_validation():
+    # Valid token
     token_valid = generate_token("MER-1005")
     caller_valid = validate_token(token_valid)
-    print(f"Valid token for MER-1005: {token_valid[:20]}... -> resolved: {caller_valid}")
+    assert caller_valid == "MER-1005"
     
-    # Test expired token
+    # Expired token
     token_expired = generate_token("MER-1005", expires_in_seconds=-10)
-    try:
+    with pytest.raises(ValueError) as excinfo:
         validate_token(token_expired)
-        print("FAIL: Expired token was accepted!")
-    except ValueError as e:
-        print(f"SUCCESS: Expired token rejected: {e}")
+    assert "expired" in str(excinfo.value).lower()
         
-    # Test malformed token
-    try:
+    # Malformed token
+    with pytest.raises(ValueError) as excinfo2:
         validate_token("this.is.malformed")
-        print("FAIL: Malformed token was accepted!")
-    except ValueError as e:
-        print(f"SUCCESS: Malformed token rejected: {e}")
+    assert "invalid" in str(excinfo2.value).lower() or "malformed" in str(excinfo2.value).lower()
 
-    print("============================================================")
-    print("2. TESTING HTTP BEARER AUTHENTICATION MIDDLEWARE")
-    print("============================================================")
-    
-    # Instantiate app with BearerAuthMiddleware and json_response=True
-    app = mcp.http_app(
+# 2. TESTING HTTP BEARER AUTHENTICATION MIDDLEWARE
+
+@pytest.fixture
+def test_app():
+    return mcp.http_app(
         transport="http",
         json_response=True,
         middleware=[Middleware(BearerAuthMiddleware)]
     )
-    
-    # Initialize JSON-RPC payload for tools/call
-    json_rpc_request = {
+
+@pytest.fixture
+def json_rpc_request():
+    return {
         "jsonrpc": "2.0",
         "method": "tools/call",
         "params": {
@@ -106,188 +89,165 @@ def main():
         "id": 2
     }
 
-    # Case A: Request without Authorization header
-    with TestClient(app) as client:
+def test_middleware_no_auth_header(test_app, json_rpc_request):
+    with TestClient(test_app) as client:
         client.headers.update({"Accept": "application/json"})
-        res_no_auth = client.post("/mcp", json=json_rpc_request)
-        pretty_print("Case A: No Authorization Header (Expected: 401)", {
-            "status_code": res_no_auth.status_code,
-            "body": res_no_auth.json() if res_no_auth.status_code == 401 else res_no_auth.text
-        })
-        
-    # Case B: Request with malformed Authorization header
-    with TestClient(app) as client:
+        res = client.post("/mcp", json=json_rpc_request)
+    assert res.status_code == 401
+    assert res.json().get("error") == "Missing Authorization header"
+
+def test_middleware_malformed_token(test_app, json_rpc_request):
+    with TestClient(test_app) as client:
         client.headers.update({"Accept": "application/json"})
-        res_malformed = client.post("/mcp", json=json_rpc_request, headers={"Authorization": "Bearer invalid-jwt-signature"})
-        pretty_print("Case B: Malformed Token (Expected: 401)", {
-            "status_code": res_malformed.status_code,
-            "body": res_malformed.json() if res_malformed.status_code == 401 else res_malformed.text
-        })
-        
-   
-    # Case C: Request with wrong audience token
+        res = client.post("/mcp", json=json_rpc_request, headers={"Authorization": "Bearer invalid-jwt-signature"})
+    assert res.status_code == 401
+    assert "Invalid token" in res.json().get("error", "")
+
+def test_middleware_wrong_audience(test_app, json_rpc_request):
     wrong_audience_payload = {
         "sub": "MER-1001",
-        "aud": "admin-dashboard",   # Wrong audience
-        "exp": datetime.datetime.now(datetime.timezone.utc)
-            + datetime.timedelta(hours=1),
+        "aud": "admin-dashboard",
+        "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1),
     }
-
-    token_wrong_audience = jwt.encode(
-        wrong_audience_payload,
-        JWT_SECRET,
-        algorithm="HS256"
-    )
-
-    with TestClient(app) as client:
+    token = jwt.encode(wrong_audience_payload, JWT_SECRET, algorithm="HS256")
+    with TestClient(test_app) as client:
         client.headers.update({"Accept": "application/json"})
-        res_wrong_audience = client.post(
-            "/mcp",
-            json=json_rpc_request,
-            headers={"Authorization": f"Bearer {token_wrong_audience}"}
-        )
+        res = client.post("/mcp", json=json_rpc_request, headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 401
+    assert "Invalid audience" in res.json().get("error", "")
 
-        pretty_print("Case C: Wrong Audience Token (Expected: 401)", {
-            "status_code": res_wrong_audience.status_code,
-            "body": res_wrong_audience.json() if res_wrong_audience.status_code == 401 else res_wrong_audience.text
-        })
-    # Case D: Request with valid token for MER-1005 (Requires session ID)
-    with TestClient(app) as client:
+def test_middleware_valid_token(test_app, json_rpc_request):
+    token = generate_token("MER-1005")
+    with TestClient(test_app) as client:
         client.headers.update({"Accept": "application/json"})
-        # 1. Establish session
-        session_id = establish_session(client, token_valid)
-        # 2. Call tool with session ID and Auth headers
-        res_valid_mer = client.post(
+        session_id = establish_session(client, token)
+        res = client.post(
             "/mcp", 
             json=json_rpc_request, 
             headers={
-                "Authorization": f"Bearer {token_valid}",
+                "Authorization": f"Bearer {token}",
                 "mcp-session-id": session_id
             }
         )
-        pretty_print("Case D: Valid Token for MER-1005 (Expected: 200 with result)", {
-            "status_code": res_valid_mer.status_code,
-            "body": res_valid_mer.json()
-        })
+    assert res.status_code == 200
+    res_json = res.json()
+    assert "result" in res_json
+    assert "error" not in res_json["result"].get("structuredContent", {})
 
-    print("============================================================")
-    print("3. TESTING CONTEXT-BASED AUTHORIZATION & MER-SCOPING OVER HTTPS")
-    print("============================================================")
+# 3. TESTING CONTEXT-BASED AUTHORIZATION & MER-SCOPING OVER HTTPS
 
-    # Case A: Merchant trying to bypass scoping (passes merchant_id="MER-1001" but is authenticated as "MER-1005")
-    with TestClient(app) as client:
+def test_cross_scoping_override(test_app):
+    token = generate_token("MER-1005")
+    json_rpc_bypass = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "get_merchant_balance",
+            "arguments": {
+                "merchant_id": "MER-1001"
+            }
+        },
+        "id": 3
+    }
+    with TestClient(test_app) as client:
         client.headers.update({"Accept": "application/json"})
-        session_id = establish_session(client, token_valid)
-        json_rpc_bypass = {
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {
-                "name": "get_merchant_balance",
-                "arguments": {
-                    "merchant_id": "MER-1001"
-                }
-            },
-            "id": 3
-        }
-        res_bypass = client.post(
+        session_id = establish_session(client, token)
+        res = client.post(
             "/mcp", 
             json=json_rpc_bypass, 
             headers={
-                "Authorization": f"Bearer {token_valid}",
+                "Authorization": f"Bearer {token}",
                 "mcp-session-id": session_id
             }
         )
-        pretty_print("Case A: Scoping Override Check (Should return MER-1005 balance despite requesting MER-1001)", {
-            "status_code": res_bypass.status_code,
-            "body": res_bypass.json()
-        })
+    assert res.status_code == 200
+    res_json = res.json()
+    assert res_json["result"]["structuredContent"]["merchant_id"] == "MER-1005"
 
-    # Case B: Admin accessing balance (ADM-01 is authorized and has ledger:read scope)
-    token_admin = generate_token("ADM-01")
-    with TestClient(app) as client:
+def test_admin_access_authorized(test_app, json_rpc_request):
+    token = generate_token("ADM-01")
+    with TestClient(test_app) as client:
         client.headers.update({"Accept": "application/json"})
-        session_id = establish_session(client, token_admin)
-        res_admin = client.post(
+        session_id = establish_session(client, token)
+        res = client.post(
             "/mcp", 
             json=json_rpc_request, 
             headers={
-                "Authorization": f"Bearer {token_admin}",
+                "Authorization": f"Bearer {token}",
                 "mcp-session-id": session_id
             }
         )
-        pretty_print("Case B: Admin access (ADM-01) (Expected: 200 with MER-1005 balance)", {
-            "status_code": res_admin.status_code,
-            "body": res_admin.json()
-        })
+    assert res.status_code == 200
+    res_json = res.json()
+    assert res_json["result"]["structuredContent"]["merchant_id"] == "MER-1005"
 
-    # Case C: Support Agent accessing balance (AGT-01 is support but lacks ledger:read scope)
-    token_agent = generate_token("AGT-01")
-    with TestClient(app) as client:
+def test_agent_access_unauthorized(test_app, json_rpc_request):
+    token = generate_token("AGT-01")
+    with TestClient(test_app) as client:
         client.headers.update({"Accept": "application/json"})
-        session_id = establish_session(client, token_agent)
-        res_agent = client.post(
+        session_id = establish_session(client, token)
+        res = client.post(
             "/mcp", 
             json=json_rpc_request, 
             headers={
-                "Authorization": f"Bearer {token_agent}",
+                "Authorization": f"Bearer {token}",
                 "mcp-session-id": session_id
             }
         )
-        pretty_print("Case C: Support Agent access (AGT-01) (Expected: 200 with map containing Unauthorized error)", {
-            "status_code": res_agent.status_code,
-            "body": res_agent.json()
-        })
+    assert res.status_code == 200
+    res_json = res.json()
+    assert "error" in res_json["result"]["structuredContent"]
+    assert "Unauthorized" in res_json["result"]["structuredContent"]["error"]
 
-    # Case D: Merchant accessing another merchant's transactions (MER-1006 calling status for MER-1013's TXN-20001)
-    token_mer_1006 = generate_token("MER-1006")
-    with TestClient(app) as client:
+def test_merchant_cross_scoping_transaction_denied(test_app):
+    token = generate_token("MER-1006")
+    json_rpc_txn = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "get_transaction_status",
+            "arguments": {
+                "txn_id": "TXN-20001"
+            }
+        },
+        "id": 4
+    }
+    with TestClient(test_app) as client:
         client.headers.update({"Accept": "application/json"})
-        session_id = establish_session(client, token_mer_1006)
-        json_rpc_txn = {
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {
-                "name": "get_transaction_status",
-                "arguments": {
-                    "txn_id": "TXN-20001"
-                }
-            },
-            "id": 4
-        }
-        res_txn_denied = client.post(
+        session_id = establish_session(client, token)
+        res = client.post(
             "/mcp", 
             json=json_rpc_txn, 
             headers={
-                "Authorization": f"Bearer {token_mer_1006}",
+                "Authorization": f"Bearer {token}",
                 "mcp-session-id": session_id
             }
         )
-        pretty_print("Case D: Merchant cross-scoping transaction (Expected: Unauthorized error payload)", {
-            "status_code": res_txn_denied.status_code,
-            "body": res_txn_denied.json()
-        })
+    assert res.status_code == 200
+    res_json = res.json()
+    assert "error" in res_json["result"]["structuredContent"]
+    assert "Unauthorized" in res_json["result"]["structuredContent"]["error"]
 
-    print("============================================================")
-    print("4. TESTING AUDIT LOGGING FOR HTTPS REQUESTS")
-    print("============================================================")
-    
-    # Query audit logs for MER-1005 tool execution (requires ADM-01 token)
-    with TestClient(app) as client:
+# 4. TESTING AUDIT LOGGING FOR HTTPS REQUESTS
+
+def test_audit_logs_https(test_app):
+    token_admin = generate_token("ADM-01")
+    json_rpc_logs = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "get_audit_logs",
+            "arguments": {
+                "target_caller_id": "MER-1005",
+                "limit": 1
+            }
+        },
+        "id": 5
+    }
+    with TestClient(test_app) as client:
         client.headers.update({"Accept": "application/json"})
         session_id = establish_session(client, token_admin)
-        json_rpc_logs = {
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {
-                "name": "get_audit_logs",
-                "arguments": {
-                    "target_caller_id": "MER-1005",
-                    "limit": 1
-                }
-            },
-            "id": 5
-        }
-        res_logs = client.post(
+        res = client.post(
             "/mcp", 
             json=json_rpc_logs, 
             headers={
@@ -295,10 +255,9 @@ def main():
                 "mcp-session-id": session_id
             }
         )
-        pretty_print("Audit Logs from MongoDB for MER-1005 actions (Requested by ADM-01)", {
-            "status_code": res_logs.status_code,
-            "body": res_logs.json()
-        })
+    assert res.status_code == 200
+    res_json = res.json()
+    assert "logs" in res_json["result"]["structuredContent"]
 
 if __name__ == "__main__":
-    main()
+    sys.exit(pytest.main([__file__]))
